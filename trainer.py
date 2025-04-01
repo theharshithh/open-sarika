@@ -1,6 +1,7 @@
 import os
 from datasets import load_from_disk
 import torch
+import torch.distributed as dist
 from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 import evaluate
@@ -12,7 +13,17 @@ from datasets import Dataset
 from torch.utils.data import Dataset as TorchDataset, DataLoader
 import torch.multiprocessing as mp
 
-mp.set_start_method('spawn', force=True)
+# Initialize distributed training if using multiple GPUs
+if int(os.environ.get("LOCAL_RANK", -1)) != -1:
+    dist.init_process_group(backend="nccl")
+    
+def rank0_print(*args):
+    """Print only on rank 0 in distributed training"""
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            print(*args)
+    else:
+        print(*args)
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -51,7 +62,7 @@ class LazySpeechDataset(TorchDataset):
         self.max_cache_size = max_cache_size
         self.feature_extractor = feature_extractor
         self.model_name = model_name
-        print(f"Initialized LazySpeechDataset with {len(raw_dataset)} examples")
+        rank0_print(f"Initialized LazySpeechDataset with {len(raw_dataset)} examples")
     
     def __len__(self):
         return len(self.raw_dataset)
@@ -267,17 +278,21 @@ class MultitaskSeq2SeqTrainer(Seq2SeqTrainer):
 
 if __name__ == "__main__":
     set_seed(42)
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if local_rank != -1:
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        rank0_print(f"Process rank: {dist.get_rank()}, device: {device}")
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    print(f"Using device: {device}")
-    print("loading dataset:")
+    rank0_print(f"Using device: {device}")
     dataset_dict = load_from_disk("modified_dataset")
     train_dataset = dataset_dict["train"]
     eval_dataset = dataset_dict["test"] if "test" in dataset_dict else dataset_dict.get("validation", dataset_dict["train"])
     
-    print(f"train dataset with {len(train_dataset)} samples")
-    print(f"eval dataset with {len(eval_dataset)} samples")
+    rank0_print(f"Train dataset with {len(train_dataset)} samples")
+    rank0_print(f"Eval dataset with {len(eval_dataset)} samples")
     
     model_name = "openai/whisper-large-v3"
     feature_extractor = WhisperFeatureExtractor.from_pretrained(model_name)
@@ -309,7 +324,9 @@ if __name__ == "__main__":
         push_to_hub=False,
         no_cuda=False,
         dataloader_num_workers=4,
-        run_name="whisper-v3-finetune-v1"
+        run_name="whisper-v3-finetune-v1",
+        local_rank=local_rank,
+        ddp_find_unused_parameters=False
     )
     
     lazy_train_dataset = LazySpeechDataset(train_dataset, feature_extractor=feature_extractor, model_name=model_name)
@@ -335,5 +352,10 @@ if __name__ == "__main__":
         model_name=model_name
     )
     
-    print(f"Using device: {device}")
+    rank0_print(f"Using device: {device}")
     trainer.train()
+    
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        rank0_print("Saving model")
+        trainer.save_model(training_args.output_dir)
+        processor.save_pretrained(training_args.output_dir)
