@@ -13,12 +13,10 @@ from datasets import Dataset
 from torch.utils.data import Dataset as TorchDataset, DataLoader
 import torch.multiprocessing as mp
 
-# Initialize distributed training if using multiple GPUs
 if int(os.environ.get("LOCAL_RANK", -1)) != -1:
     dist.init_process_group(backend="nccl")
     
 def rank0_print(*args):
-    """Print only on rank 0 in distributed training"""
     if dist.is_initialized():
         if dist.get_rank() == 0:
             print(*args)
@@ -62,28 +60,50 @@ class LazySpeechDataset(TorchDataset):
         self.max_cache_size = max_cache_size
         self.feature_extractor = feature_extractor
         self.model_name = model_name
+        self.valid_indices = list(range(len(raw_dataset)))  # Start with all indices
         rank0_print(f"Initialized LazySpeechDataset with {len(raw_dataset)} examples")
     
     def __len__(self):
-        return len(self.raw_dataset)
+        return len(self.valid_indices)
     
     def __getitem__(self, idx):
-        if idx in self.cached_data:
-            return self.cached_data[idx]
+        actual_idx = self.valid_indices[idx]
+        
+        if actual_idx in self.cached_data:
+            return self.cached_data[actual_idx]
         
         if len(self.cached_data) >= self.max_cache_size:
             remove_count = self.max_cache_size // 10
             for old_idx in list(self.cached_data.keys())[:remove_count]:
                 del self.cached_data[old_idx]
         
-        raw_item = self.raw_dataset[idx]
+        raw_item = self.raw_dataset[actual_idx]
         processed_item = self.prepare_dataset_item(raw_item)
-        self.cached_data[idx] = processed_item
         
-        return processed_item
+        if processed_item is not None:
+            self.cached_data[actual_idx] = processed_item
+            return processed_item
+        
+        self.valid_indices.remove(actual_idx)
+        
+        if len(self.valid_indices) > 0:
+            next_idx = self.valid_indices[0]
+            return self.__getitem__(0)
+        else:
+            rank0_print("WARNING: No valid examples found in dataset!")
+            return {
+                "input_features": torch.zeros(80, 3000),
+                "labels": torch.tensor([1, 2]),
+                "language": "hindi",
+                "task": "transcribe"
+            }
     
     def prepare_dataset_item(self, item):
         audio = item["chunked_audio_filepath"]
+        
+        if len(audio["array"]) > 480000:
+            rank0_print(f"Skipping sample with {len(audio['array'])} samples (too long)")
+            return None
         
         processed_item = {}
         processed_item["input_features"] = self.feature_extractor(
@@ -127,7 +147,17 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     tokenizer: Any
 
     def __call__(self, features):
-        features = [f for f in features if f is not None]            
+        features = [f for f in features if f is not None]
+        
+        if not features:
+            rank0_print("WARNING: Empty batch encountered, skipping")
+            return {
+                "input_features": torch.zeros((0, 80, 3000), device="cpu"),
+                "labels": torch.zeros((0, 1), dtype=torch.long, device="cpu"),
+                "_language": [],
+                "_task": []
+            }
+        
         input_features = [{"input_features": feature["input_features"]} for feature in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
         
@@ -139,6 +169,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             labels = labels[:, 1:]
 
         batch["labels"] = labels
+        # Store language and task with underscore prefix to indicate they're metadata, not model inputs
         batch["_language"] = [feature.get("language", "") for feature in features]
         batch["_task"] = [feature.get("task", "transcribe") for feature in features]
 
@@ -174,8 +205,19 @@ class MultitaskSeq2SeqTrainer(Seq2SeqTrainer):
         super().__init__(*args, **kwargs)
         self.model = self.model.to(self.args.device)
         self.model_name = model_name
+        self.empty_batch_count = 0
+        self.max_empty_batches = 10
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+
+        if inputs.get("input_features", None) is None or inputs["input_features"].shape[0] == 0:
+            self.empty_batch_count += 1
+            if self.empty_batch_count > self.max_empty_batches:
+                rank0_print(f"WARNING: Encountered {self.empty_batch_count} empty batches, consider rebuilding dataset")
+            return torch.tensor(0.0, device=self.args.device, requires_grad=True)
+            
+        self.empty_batch_count = 0
+        
         input_copy = dict(inputs)
         
         if "language" in input_copy:
@@ -299,6 +341,8 @@ if __name__ == "__main__":
     
     model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
     
+    model.config.use_cache = False
+
     tokenizer = WhisperTokenizer.from_pretrained(model_name, language="Hindi", task="transcribe")
     processor = WhisperProcessor.from_pretrained(model_name, language="Hindi", task="transcribe")
     
@@ -312,7 +356,7 @@ if __name__ == "__main__":
         gradient_checkpointing=True,
         fp16=True,
         evaluation_strategy="epoch",
-        per_device_eval_batch_size=8,
+        per_device_eval_batch_size=16,
         predict_with_generate=True,
         generation_max_length=225,
         save_strategy="epoch",
@@ -326,7 +370,9 @@ if __name__ == "__main__":
         dataloader_num_workers=4,
         run_name="whisper-v3-finetune-v1",
         local_rank=local_rank,
-        ddp_find_unused_parameters=False
+        ddp_find_unused_parameters=False,
+        optim="adamw_torch",
+        max_grad_norm=1.0,
     )
     
     lazy_train_dataset = LazySpeechDataset(train_dataset, feature_extractor=feature_extractor, model_name=model_name)
@@ -359,3 +405,11 @@ if __name__ == "__main__":
         rank0_print("Saving model")
         trainer.save_model(training_args.output_dir)
         processor.save_pretrained(training_args.output_dir)
+    
+    rank0_print("Cleaning up memory...")
+    del model
+    del trainer
+    torch.cuda.empty_cache()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    rank0_print("Training complete.")
